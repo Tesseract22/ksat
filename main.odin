@@ -107,6 +107,17 @@ Record_deserialize :: proc(buf: ^[]u8) -> (record: Record, rest: []u8, success: 
     return
 }
 
+Duration_pprint :: proc(d: time.Duration) {
+    hour := i64(d/time.Hour)
+    min := i64((d%time.Hour)/time.Minute)
+    if hour > 0 {
+	fmt.printf("%vh", hour)
+    }
+    if hour > 0 || min > 0 {
+	fmt.printf("%vm", min)
+    }
+}
+
 Record_pprint :: proc(record: Record, tasks: [dynamic]string, region: ^datetime.TZ_Region) {
     Time_pprint :: proc(t: Time, region: ^datetime.TZ_Region) {
 	dt_utc, success := time.time_to_datetime(t)
@@ -114,16 +125,7 @@ Record_pprint :: proc(record: Record, tasks: [dynamic]string, region: ^datetime.
 	dt := tz.datetime_to_tz(dt_utc, region)
 	fmt.printf("%2v/%2v, %2v:%2v", dt.month, dt.day, dt.hour, dt.minute)
     }
-    Duration_pprint :: proc(d: time.Duration) {
-	hour := i64(d/time.Hour)
-	min := i64((d%time.Hour)/time.Minute)
-	if hour > 0 {
-	    fmt.printf("%vh", hour)
-	}
-	if hour > 0 || min > 0 {
-	    fmt.printf("%vm", min)
-	}
-    }
+
     if cast(int) record.task >= len(tasks) {
 	fmt.printf("%unknown task(5i): ", record.task)
     } else {
@@ -171,11 +173,11 @@ parse_cli_args :: proc() -> (opts: Options, success := true) {
     print_subs :: proc() {
 	fmt.println("subcommands:")
 	fmt.println("  start    Starts recording")
-	fmt.println("  list	list records")
-	fmt.println("  new	add a new task")
-	fmt.println("  rm	remove a task")
-	fmt.println("  tasks 	list tasks")
-	fmt.println("  help	print help message (for a specific command)")
+	fmt.println("  list     list records")
+	fmt.println("  new      add a new task")
+	fmt.println("  rm       remove a task")
+	fmt.println("  tasks    list tasks")
+	fmt.println("  help     print help message (for a specific command)")
     }
     print_help_for_sub :: proc(sub: Command) {
 	fmt.printf("expect: %s", sub)
@@ -200,6 +202,13 @@ parse_cli_args :: proc() -> (opts: Options, success := true) {
 	    return cast(u32) task_u64
 	}
     }
+    expect_task_after :: proc(args: ^[]string, before: string) -> Task {
+	if task_str, success := shift_args(args); !success {
+	    fatal("Expect <task> after %s", before)
+	} else {
+	    return parse_task_id_or_name(task_str)
+	}
+    }
 
     defer if !success {
 	if opts.command == .None {
@@ -221,14 +230,17 @@ parse_cli_args :: proc() -> (opts: Options, success := true) {
     switch command {
 	case "start":
 	    opts.command = .start
-	    task_str: string
-	    if task_str, success = shift_args(&args); !success {
-		fmt.println("error: Expecet positional argument <task>")
-		return
-	    }
-	    opts.task = parse_task_id_or_name(task_str)
+	    opts.task = expect_task_after(&args, "start")
 	case "list":
 	    opts.command = .list
+	    for arg in shift_args(&args) {
+		switch arg {
+		case "--task", "-t":
+		    opts.task = expect_task_after(&args, arg)
+		case:
+		    fatal("Unknown argument")
+		}
+	    }
 	case "new":
 	    opts.command = .new
 	    if opts.task, success = shift_args(&args); !success {
@@ -237,16 +249,11 @@ parse_cli_args :: proc() -> (opts: Options, success := true) {
 	    }
 	case "rm":
 	    opts.command = .rm
-	    task_str: string
-	    if task_str, success = shift_args(&args); !success {
-		fmt.println("error: Expecet positional argument <task>")
-		return
-	    }
-	    opts.task = parse_task_id_or_name(task_str)
+	    opts.task = expect_task_after(&args, "start")
 	case "tasks":
 	    opts.command = .tasks
-	case "help", "-h":
-	    opts.command = .help
+	case "help", "--help", "-h":
+	    //opts.command = .help
 	    success = false
 	    return
 	case:
@@ -254,9 +261,23 @@ parse_cli_args :: proc() -> (opts: Options, success := true) {
 	    success = false
 	    return
     }
+    return
+}
 
-    // for arg in shift_args(&args) { fmt.println(arg)
-    // }
+task_get_id :: proc(task: Task, tasks: [dynamic]string, task_map: map[string]u32) -> (task_id: u32) {
+    switch data in task {
+    case u32: {
+	if cast(int) data >= len(tasks) {
+	    fatal("unknown task id %v", data)
+	}
+	task_id = data
+    }
+    case string:
+	if !(data in task_map) {
+    	    fatal("unknown task name %v", data)
+    	}
+	task_id = task_map[data]
+    }
     return
 }
 
@@ -322,20 +343,7 @@ main :: proc() {
 	    fmt.fprintln(task_f, key)
 	}
     case .start:
-	task_id: u32
-	switch data in opts.task {
-	case u32: {
-	    if cast(int) data >= len(tasks) {
-		fatal("unknown task id %v", data)
-	    }
-	    task_id = data
-	}
-	case string:
-	    if !(data in task_map) {
-	        fatal("unknown task name %v", data)
-	    }
-	    task_id = task_map[data]
-	}
+	task_id := task_get_id(opts.task, tasks, task_map)
 	start := time.now()
 	fmt.printfln("task `%s` starts at %v", opts.task, start)
 
@@ -367,9 +375,27 @@ main :: proc() {
 	    fmt.printf("cannot read %v: %v\n", RECORDS_PATH, err1)
 	    return
 	}
+	task_id := task_get_id(opts.task, tasks, task_map)
 
+	task_duration :map[u32]time.Duration
 	for record in Record_deserialize(&content) {
-	    Record_pprint(record, tasks, region)
+	    if opts.task == nil || task_id == record.task {
+		Record_pprint(record, tasks, region)
+
+		duration := time.diff(record.start, record.end)
+		if !(record.task in task_duration) {
+		    task_duration[record.task] = 0
+		}
+		task_duration[record.task] += duration
+	    }
+	}
+
+	fmt.println("\nstatistics:")
+	for task, duration in task_duration {
+	    name := tasks[task]
+	    fmt.printf("%-20s: ", name)
+	    Duration_pprint(duration)
+	    fmt.println()
 	}
     }
 }
