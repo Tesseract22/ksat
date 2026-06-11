@@ -7,8 +7,10 @@ Id :: u32
 Task :: struct {
     name: string,
     children: [dynamic]Id,
-    parent: Maybe(Id),
+    parent: Id,
 }
+TASK_ROOT_ID :Id : 0
+
 
 fatal :: proc(format: string, args: ..any) -> ! {
     fmt.print("fatal: ")
@@ -18,7 +20,14 @@ fatal :: proc(format: string, args: ..any) -> ! {
 
 read_tasks :: proc(file: ^os.File) -> (tasks: [dynamic]Task, task_map: map[string]Id, err: os.Error) {
     content := read_all(file) or_return
-    idx : Id = 0
+    TASK_ROOT := Task {
+	"all",
+	{},
+	0
+    }
+    append(&tasks, TASK_ROOT)
+    task_map[TASK_ROOT.name] = TASK_ROOT_ID
+    idx := TASK_ROOT_ID + 1
     for line_bytes in bytes.split_iterator(&content, {'\n'}) {
 	line := string(line_bytes)
 	name, success := strings.split_iterator(&line, ",")
@@ -29,7 +38,7 @@ read_tasks :: proc(file: ^os.File) -> (tasks: [dynamic]Task, task_map: map[strin
 	if !success2 {
 	    fatal("CORRUPT TASK")
 	}
-	maybe_parent_id, success3 := strconv.parse_i64(parent_id_str, 10)
+	parent_id, success3 := strconv.parse_u64(parent_id_str, 10)
 	if !success3 {
 	    fatal("CORRUPT TASK")
 	}
@@ -38,14 +47,10 @@ read_tasks :: proc(file: ^os.File) -> (tasks: [dynamic]Task, task_map: map[strin
 	} else {
 	    task_map[name] = idx
 	}
-	parent_id : Maybe(Id) = nil
-	if maybe_parent_id >= 0 {
-	    parent_id = cast(u32) maybe_parent_id
-	    if auto_cast maybe_parent_id >= len(tasks) {
-		fatal("unknwon id `%v` for parent, parent must be declared before child", parent_id)
-	    }
-	    append(&tasks[maybe_parent_id].children, idx)
+	if auto_cast parent_id >= len(tasks) {
+	    fatal("unknwon id `%v` for parent, parent must be declared before child", parent_id)
 	}
+	append(&tasks[parent_id].children, idx)
 	append(&tasks, Task {name, {}, auto_cast parent_id})
 	idx += 1
     }
@@ -338,21 +343,67 @@ task_get_id :: proc(task: Task_Id_Name, tasks: [dynamic]Task, task_map: map[stri
     return
 }
 
-task_tree_pprint :: proc(tasks: [dynamic]Task) {
-    print :: proc(tasks: [dynamic]Task, node: Task, depth: u32) {
-	for _ in 0..<4*depth {
-	    fmt.print(" ")
+task_tree_pprint :: proc(start: Id, tasks: [dynamic]Task, task_duration: []Duration) {
+    assert(len(tasks) == len(task_duration))
+    print :: proc(tasks: [dynamic]Task, task_duration: []Duration, acc_duration: []Duration, id: Id, depth: u32) {
+	is_root := false && id == TASK_ROOT_ID
+	node := tasks[id]
+	if !is_root {
+	    for i in 0..<depth {
+		fmt.print("    ")
+	    }
+	    fmt.printf("|-- %s ", node.name)
+	    acc := acc_duration[id]
+	    Duration_pprint(acc)
+	    if id != TASK_ROOT_ID {
+		parent_perct := f32(acc)/f32(acc_duration[node.parent]) * 100
+		root_perct := f32(acc)/f32(acc_duration[TASK_ROOT_ID]) * 100
+		fmt.printf(" [%.2f%%, %.2f%%]", parent_perct, root_perct)
+	    }
+	    fmt.println()
 	}
-	fmt.printfln("|-- %s", node.name)
 	for child in node.children {
-	    print(tasks, tasks[child], depth + 1)
+	    print(tasks, task_duration, acc_duration, child, depth + 1 if !is_root else 0)
 	}
-    }
-    for task in tasks {
-	if task.parent == nil {
-	    print(tasks, task, 0)
+	if len(node.children) != 0 && task_duration[id] != 0 {
+	    for _ in 0..<depth+1 {
+		fmt.print("    ")
+	    }
+	    fmt.printf("|-- %s    ", "<unspecified>")
+	    dura := task_duration[id]
+	    Duration_pprint(dura)
+
+	    parent_perct := f32(dura)/f32(acc_duration[id]) * 100
+	    root_perct := f32(dura)/f32(acc_duration[TASK_ROOT_ID]) * 100
+
+	    fmt.printf(" [%.2f%%, %.2f%%]", parent_perct, root_perct)
+	    fmt.println()
 	}
+
+
     }
+    calc_accumulated_duration :: proc(tasks: [dynamic]Task, task_duration: []Duration, acc_duration: []Duration, id: Id) -> (total: Duration) {
+	total += task_duration[id]
+	for child in tasks[id].children {
+	    total += calc_accumulated_duration(tasks, task_duration, acc_duration, child)
+	}
+	acc_duration[id] = total
+	return
+    }
+    acc_duration := make([]Duration, len(tasks))
+    calc_accumulated_duration(tasks, task_duration, acc_duration, TASK_ROOT_ID)
+
+    print(tasks, task_duration, acc_duration, TASK_ROOT_ID, 0)
+}
+
+calc_duration :: proc(tasks: [dynamic]Task, records: []u8) -> (task_duration: []Duration) {
+    content := records
+    task_duration = make([]Duration, len(tasks))
+    for record in Record_deserialize(&content) {
+	duration := time.diff(record.start, record.end)
+	task_duration[record.task] += duration
+    }
+    return
 }
 
 main :: proc() {
@@ -388,13 +439,13 @@ main :: proc() {
 	log.assert(false)
     case .new:
 	name := opts.task.(string)
-	if _, success = strconv.parse_i64(name, 10); success {
+	if _, success = strconv.parse_u64(name, 10); success {
 	    fatal("task name cannot be numbers, got %v", name)
 	}
 	if name in task_map {
 	    fatal("duplicate task %v", name)
 	}
-	parent_id : i64 = i64(task_get_id(opts.parent, tasks, task_map)) if opts.parent != nil else -1
+	parent_id := task_get_id(opts.parent, tasks, task_map) if opts.parent != nil else TASK_ROOT_ID
 	fmt.fprintfln(task_f, "%s,%i", name, parent_id)
     case .rm:
 	task_name: string
@@ -441,7 +492,14 @@ main :: proc() {
 
 	Record_serialize(f, { start, end, task_id })
     case .tasks:
-	task_tree_pprint(tasks)
+	content, err1 := read_all(f)
+	if err1 != nil {
+	    fmt.printf("cannot read %v: %v\n", RECORDS_PATH, err1)
+	    return
+	}
+	start := task_get_id(opts.task, tasks, task_map) if opts.task != nil else TASK_ROOT_ID
+	task_duration := calc_duration(tasks, content) // TODO: filter
+	task_tree_pprint(start, tasks, task_duration)
     case .list:
 	content, err1 := read_all(f)
 	if err1 != nil {
@@ -450,25 +508,10 @@ main :: proc() {
 	}
 	task_id := task_get_id(opts.task, tasks, task_map)
 
-	task_duration :map[Id]time.Duration
 	for record in Record_deserialize(&content) {
 	    if opts.task == nil || task_id == record.task {
 		Record_pprint(record, tasks, region)
-
-		duration := time.diff(record.start, record.end)
-		if !(record.task in task_duration) {
-		    task_duration[record.task] = 0
-		}
-		task_duration[record.task] += duration
 	    }
-	}
-
-	fmt.println("\nstatistics:")
-	for id, duration in task_duration {
-	    name := tasks[id].name
-	    fmt.printf("%-20s: ", name)
-	    Duration_pprint(duration)
-	    fmt.println()
 	}
     }
 }
@@ -477,7 +520,7 @@ import "core:os"
 import "core:fmt"
 import "core:bytes"
 import "core:strings"
-import "core:time"; Time :: time.Time
+import "core:time"; Time :: time.Time; Duration :: time.Duration
 import tz "core:time/timezone"
 import "core:time/datetime"
 import "core:strconv"
