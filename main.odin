@@ -3,23 +3,50 @@ package main
 RECORDS_PATH :: "records.txt"
 TASKS_PATH :: "tasks.txt"
 
+Id :: u32
+Task :: struct {
+    name: string,
+    children: [dynamic]Id,
+    parent: Maybe(Id),
+}
+
 fatal :: proc(format: string, args: ..any) -> ! {
     fmt.print("fatal: ")
     fmt.printfln(format, ..args)
     os.exit(1)
 }
 
-read_tasks :: proc(file: ^os.File) -> (tasks: [dynamic]string, task_map: map[string]u32, err: os.Error) {
+read_tasks :: proc(file: ^os.File) -> (tasks: [dynamic]Task, task_map: map[string]Id, err: os.Error) {
     content := read_all(file) or_return
-    idx : u32 = 0
-    for line in bytes.split_iterator(&content, {'\n'}) {
-	str := string(line)
-	append(&tasks, str)
-	if str in task_map {
-	    fmt.printfln("error: duplicate task %s", str)
-	} else {
-	    task_map[str] = idx
+    idx : Id = 0
+    for line_bytes in bytes.split_iterator(&content, {'\n'}) {
+	line := string(line_bytes)
+	name, success := strings.split_iterator(&line, ",")
+	if !success {
+	    fatal("CORRUPT TASK")
 	}
+	parent_id_str, success2 := strings.split_iterator(&line, ",")
+	if !success2 {
+	    fatal("CORRUPT TASK")
+	}
+	maybe_parent_id, success3 := strconv.parse_i64(parent_id_str, 10)
+	if !success3 {
+	    fatal("CORRUPT TASK")
+	}
+	if name in task_map {
+	    fmt.printfln("error: duplicate task %s", name)
+	} else {
+	    task_map[name] = idx
+	}
+	parent_id : Maybe(Id) = nil
+	if maybe_parent_id >= 0 {
+	    parent_id = cast(u32) maybe_parent_id
+	    if auto_cast maybe_parent_id >= len(tasks) {
+		fatal("unknwon id `%v` for parent, parent must be declared before child", parent_id)
+	    }
+	    append(&tasks[maybe_parent_id].children, idx)
+	}
+	append(&tasks, Task {name, {}, auto_cast parent_id})
 	idx += 1
     }
     return
@@ -41,12 +68,10 @@ read_all :: proc(file: ^os.File) -> ([]u8, os.Error) {
     return res[:], nil
 }
 
-Time :: time.Time
-
 Record :: struct {
     start: Time,
     end: Time,
-    task: u32,
+    task: Id,
 }
 
 Record_serialize :: proc(f: ^os.File, record: Record) -> os.Error {
@@ -118,7 +143,7 @@ Duration_pprint :: proc(d: time.Duration) {
     }
 }
 
-Record_pprint :: proc(record: Record, tasks: [dynamic]string, region: ^datetime.TZ_Region) {
+Record_pprint :: proc(record: Record, tasks: [dynamic]Task, region: ^datetime.TZ_Region) {
     Time_pprint :: proc(t: Time, region: ^datetime.TZ_Region) {
 	dt_utc, success := time.time_to_datetime(t)
 	assert(success)
@@ -129,7 +154,7 @@ Record_pprint :: proc(record: Record, tasks: [dynamic]string, region: ^datetime.
     if cast(int) record.task >= len(tasks) {
 	fmt.printf("%unknown task(5i): ", record.task)
     } else {
-	fmt.printf("%-20s: ", tasks[record.task])
+	fmt.printf("%-20s: ", tasks[record.task].name)
     }
 
     Time_pprint(record.start, region)
@@ -153,11 +178,12 @@ Command :: enum {
     help
 }
 
-Task :: union { u32, string }
+Task_Id_Name :: union { Id, string }
 
 Options :: struct {
     command: Command,
-    task: Task,
+    task: Task_Id_Name,
+    parent: Task_Id_Name,
 }
 parse_cli_args :: proc() -> (opts: Options, success := true) {
     shift_args :: proc(args: ^[]string) -> (string, bool) {
@@ -172,7 +198,7 @@ parse_cli_args :: proc() -> (opts: Options, success := true) {
 
     print_subs :: proc() {
 	fmt.println("subcommands:")
-	fmt.println("  start    Starts recording")
+	fmt.println("  start    starts recording")
 	fmt.println("  list     list records")
 	fmt.println("  new      add a new task")
 	fmt.println("  rm       remove a task")
@@ -186,27 +212,46 @@ parse_cli_args :: proc() -> (opts: Options, success := true) {
 	case .start:
 	    fmt.println(" <task>")
 	case .list:
+	    fmt.println(" [-t/--task <task>]")
 	case .rm:
-	    fallthrough
-	case .new:
 	    fmt.println(" <task_name>")
+	case .new:
+	    fmt.println(" <task_name> [-p/--parent <task>]")
 	case .tasks:
 	case .help:
-	    fmt.println(" <subcommand>")
+	    fmt.println(" [<subcommand>]")
 	}
     }
-    parse_task_id_or_name :: proc(task_str: string) -> Task {
+    parse_task_id_or_name :: proc(task_str: string) -> Task_Id_Name {
 	if task_u64, parse_success := strconv.parse_u64(task_str); !parse_success {
 	    return task_str
 	} else {
-	    return cast(u32) task_u64
+	    return cast(Id) task_u64
 	}
     }
-    expect_task_after :: proc(args: ^[]string, before: string) -> Task {
+    expect_task_after :: proc(args: ^[]string, before: string) -> Task_Id_Name {
 	if task_str, success := shift_args(args); !success {
 	    fatal("Expect <task> after %s", before)
 	} else {
 	    return parse_task_id_or_name(task_str)
+	}
+    }
+    parse_subcommand :: proc "contextless" (arg: string) -> Command {
+	switch arg {
+	case "start":
+	    return .start
+	case "list":
+	    return .list
+	case "new":
+	    return .new
+	case "rm":
+	    return .rm
+	case "tasks":
+	    return .tasks
+	case "help", "--help", "-h":
+	    return .help
+	case:
+	    return .None
 	}
     }
 
@@ -227,46 +272,58 @@ parse_cli_args :: proc() -> (opts: Options, success := true) {
 	return
     }
 
-    switch command {
-	case "start":
-	    opts.command = .start
-	    opts.task = expect_task_after(&args, "start")
-	case "list":
-	    opts.command = .list
-	    for arg in shift_args(&args) {
-		switch arg {
-		case "--task", "-t":
-		    opts.task = expect_task_after(&args, arg)
-		case:
-		    fatal("Unknown argument")
+    opts.command = parse_subcommand(command)
+
+    switch opts.command {
+    case .start:
+	opts.task = expect_task_after(&args, "start")
+    case .list:
+	for arg in shift_args(&args) {
+	    switch arg {
+	    case "--task", "-t":
+		opts.task = expect_task_after(&args, arg)
+	    case:
+		fatal("Unknown argument")
+	    }
+	}
+    case .new:
+	opts.command = .new
+	for arg in shift_args(&args) {
+	    switch arg {
+	    case "--parent", "-p":
+		opts.parent = expect_task_after(&args, arg)
+	    case:
+		if opts.task != nil {
+		    fmt.printfln("error: Extra positional arg `%s`", arg)
+		    return
 		}
+		opts.task = arg
 	    }
-	case "new":
-	    opts.command = .new
-	    if opts.task, success = shift_args(&args); !success {
-		fmt.println("error: Expect postional argument <task_name>")
-		return
-	    }
-	case "rm":
-	    opts.command = .rm
-	    opts.task = expect_task_after(&args, "start")
-	case "tasks":
-	    opts.command = .tasks
-	case "help", "--help", "-h":
-	    //opts.command = .help
-	    success = false
-	    return
-	case:
-	    fmt.printfln("error: Unknown subcommand `%s`", command)
-	    success = false
-	    return
+	}
+    case .rm:
+	opts.command = .rm
+	opts.task = expect_task_after(&args, "start")
+    case .tasks:
+	opts.command = .tasks
+    case .help:
+	success = false
+	if help_sub, success := shift_args(&args); !success {
+	    opts.command = .None
+	} else {
+	    opts.command = parse_subcommand(help_sub)
+	}
+	return
+    case .None:
+	fmt.printfln("error: Unknown subcommand `%s`", command)
+	success = false
+	return
     }
     return
 }
 
-task_get_id :: proc(task: Task, tasks: [dynamic]string, task_map: map[string]u32) -> (task_id: u32) {
+task_get_id :: proc(task: Task_Id_Name, tasks: [dynamic]Task, task_map: map[string]Id) -> (task_id: Id) {
     switch data in task {
-    case u32: {
+    case Id: {
 	if cast(int) data >= len(tasks) {
 	    fatal("unknown task id %v", data)
 	}
@@ -279,6 +336,23 @@ task_get_id :: proc(task: Task, tasks: [dynamic]string, task_map: map[string]u32
 	task_id = task_map[data]
     }
     return
+}
+
+task_tree_pprint :: proc(tasks: [dynamic]Task) {
+    print :: proc(tasks: [dynamic]Task, node: Task, depth: u32) {
+	for _ in 0..<4*depth {
+	    fmt.print(" ")
+	}
+	fmt.printfln("|-- %s", node.name)
+	for child in node.children {
+	    print(tasks, tasks[child], depth + 1)
+	}
+    }
+    for task in tasks {
+	if task.parent == nil {
+	    print(tasks, task, 0)
+	}
+    }
 }
 
 main :: proc() {
@@ -320,15 +394,16 @@ main :: proc() {
 	if name in task_map {
 	    fatal("duplicate task %v", name)
 	}
-	fmt.fprintln(task_f, name)
+	parent_id : i64 = i64(task_get_id(opts.parent, tasks, task_map)) if opts.parent != nil else -1
+	fmt.fprintfln(task_f, "%s,%i", name, parent_id)
     case .rm:
 	task_name: string
 	switch data in opts.task {
-	case u32: {
+	case Id: {
 	    if cast(int) data >= len(tasks) {
 		fatal("unknown task id %v", data)
 	    }
-	    task_name = tasks[data]
+	    task_name = tasks[data].name
 	}
 	case string:
 	    if !(data in task_map) {
@@ -366,9 +441,7 @@ main :: proc() {
 
 	Record_serialize(f, { start, end, task_id })
     case .tasks:
-	for name, i in tasks {
-	    fmt.printfln("%2i: %s", i, name)
-	}
+	task_tree_pprint(tasks)
     case .list:
 	content, err1 := read_all(f)
 	if err1 != nil {
@@ -377,7 +450,7 @@ main :: proc() {
 	}
 	task_id := task_get_id(opts.task, tasks, task_map)
 
-	task_duration :map[u32]time.Duration
+	task_duration :map[Id]time.Duration
 	for record in Record_deserialize(&content) {
 	    if opts.task == nil || task_id == record.task {
 		Record_pprint(record, tasks, region)
@@ -391,8 +464,8 @@ main :: proc() {
 	}
 
 	fmt.println("\nstatistics:")
-	for task, duration in task_duration {
-	    name := tasks[task]
+	for id, duration in task_duration {
+	    name := tasks[id].name
 	    fmt.printf("%-20s: ", name)
 	    Duration_pprint(duration)
 	    fmt.println()
@@ -404,10 +477,12 @@ import "core:os"
 import "core:fmt"
 import "core:bytes"
 import "core:strings"
-import "core:time"
+import "core:time"; Time :: time.Time
 import tz "core:time/timezone"
 import "core:time/datetime"
 import "core:strconv"
 import "core:log"
-import "core:reflect"
+import "core:container/bit_array"
+
+import "base:runtime"; Maybe :: runtime.Maybe
 
