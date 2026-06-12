@@ -30,18 +30,10 @@ read_tasks :: proc(file: ^os.File) -> (tasks: [dynamic]Task, task_map: map[strin
     idx := TASK_ROOT_ID + 1
     for line_bytes in bytes.split_iterator(&content, {'\n'}) {
 	line := string(line_bytes)
-	name, success := strings.split_iterator(&line, ",")
-	if !success {
-	    fatal("CORRUPT TASK")
-	}
-	parent_id_str, success2 := strings.split_iterator(&line, ",")
-	if !success2 {
-	    fatal("CORRUPT TASK")
-	}
-	parent_id, success3 := strconv.parse_u64(parent_id_str, 10)
-	if !success3 {
-	    fatal("CORRUPT TASK")
-	}
+	name := strings.split_iterator(&line, ",")  or_else fatal("CORRUPT TASK")
+	parent_id_str := strings.split_iterator(&line, ",") or_else fatal("CORRUPT TASK")
+	parent_id := strconv.parse_u64(parent_id_str, 10) or_else fatal("CORRUPT TASK")
+
 	if name in task_map {
 	    fmt.printfln("error: duplicate task %s", name)
 	} else {
@@ -345,14 +337,18 @@ task_get_id :: proc(task: Task_Id_Name, tasks: [dynamic]Task, task_map: map[stri
 
 task_tree_pprint :: proc(start: Id, tasks: [dynamic]Task, task_duration: []Duration) {
     assert(len(tasks) == len(task_duration))
+    print_entry_start :: proc(name: string, depth: u32) {
+	for i in 0..<depth {
+	    fmt.print("    ")
+	}
+	fmt.printf("|-- %s ", name)
+
+    }
     print :: proc(tasks: [dynamic]Task, task_duration: []Duration, acc_duration: []Duration, id: Id, depth: u32) {
 	is_root := false && id == TASK_ROOT_ID
 	node := tasks[id]
 	if !is_root {
-	    for i in 0..<depth {
-		fmt.print("    ")
-	    }
-	    fmt.printf("|-- %s ", node.name)
+	    print_entry_start(node.name, depth)
 	    acc := acc_duration[id]
 	    Duration_pprint(acc)
 	    if id != TASK_ROOT_ID {
@@ -366,10 +362,7 @@ task_tree_pprint :: proc(start: Id, tasks: [dynamic]Task, task_duration: []Durat
 	    print(tasks, task_duration, acc_duration, child, depth + 1 if !is_root else 0)
 	}
 	if len(node.children) != 0 && task_duration[id] != 0 {
-	    for _ in 0..<depth+1 {
-		fmt.print("    ")
-	    }
-	    fmt.printf("|-- %s    ", "<unspecified>")
+	    print_entry_start("<unspecified>", depth+1)
 	    dura := task_duration[id]
 	    Duration_pprint(dura)
 
@@ -379,8 +372,6 @@ task_tree_pprint :: proc(start: Id, tasks: [dynamic]Task, task_duration: []Durat
 	    fmt.printf(" [%.2f%%, %.2f%%]", parent_perct, root_perct)
 	    fmt.println()
 	}
-
-
     }
     calc_accumulated_duration :: proc(tasks: [dynamic]Task, task_duration: []Duration, acc_duration: []Duration, id: Id) -> (total: Duration) {
 	total += task_duration[id]
@@ -412,22 +403,27 @@ main :: proc() {
     opts, success := parse_cli_args();
     if !success do return
 
-    f, err := os.open(RECORDS_PATH, {.Read, .Write, .Create, .Append})
-    if err != nil {
-	fmt.printf("cannot open %v: %v\n", RECORDS_PATH, err)
-	return
+    f 		: ^os.File
+    task_f 	: ^os.File
+    content 	: []u8 
+    err 	: os.Error
+    tasks 	: [dynamic]Task
+    task_map 	: map[string]Id
+
+    if f, err = os.open(RECORDS_PATH, {.Read, .Write, .Create, .Append}); err != nil {
+	fatal("cannot open %v: %v\n", RECORDS_PATH, err)
     }
     defer os.close(f)
-    task_f, err1 := os.open(TASKS_PATH, {.Read, .Write, .Create, .Append})
-    if err1 != nil {
-	fmt.printf("cannot open %v: %v", TASKS_PATH, err1)
-	return
+    if content, err = read_all(f); err != nil {
+	fatal("cannot read %v: %v\n", RECORDS_PATH, err)
+    }
+
+    if task_f, err = os.open(TASKS_PATH, {.Read, .Write, .Create, .Append}); err != nil {
+	fatal("cannot open %v: %v", TASKS_PATH, err)
     }
     defer os.close(task_f)
-    tasks, task_map, err2 := read_tasks(task_f)
-    if err2 != nil {
-	fmt.printf("cannot read tasks from %v: %v", TASKS_PATH, err2)
-	return
+    if tasks, task_map, err = read_tasks(task_f); err != nil {
+	fatal("cannot read tasks from %v: %v", TASKS_PATH, err)
     }
 
     region := tz.region_load("local") or_else {}
@@ -492,20 +488,11 @@ main :: proc() {
 
 	Record_serialize(f, { start, end, task_id })
     case .tasks:
-	content, err1 := read_all(f)
-	if err1 != nil {
-	    fmt.printf("cannot read %v: %v\n", RECORDS_PATH, err1)
-	    return
-	}
+
 	start := task_get_id(opts.task, tasks, task_map) if opts.task != nil else TASK_ROOT_ID
 	task_duration := calc_duration(tasks, content) // TODO: filter
 	task_tree_pprint(start, tasks, task_duration)
     case .list:
-	content, err1 := read_all(f)
-	if err1 != nil {
-	    fmt.printf("cannot read %v: %v\n", RECORDS_PATH, err1)
-	    return
-	}
 	task_id := task_get_id(opts.task, tasks, task_map)
 
 	for record in Record_deserialize(&content) {
@@ -528,4 +515,3 @@ import "core:log"
 import "core:container/bit_array"
 
 import "base:runtime"; Maybe :: runtime.Maybe
-
